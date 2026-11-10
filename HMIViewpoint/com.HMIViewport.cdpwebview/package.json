@@ -1,0 +1,12 @@
+{
+  "name": "com.HMIViewport.cdpwebview",
+  "version": "0.1.0",
+  "displayName": "CDP WebView (free)",
+  "description": "Free Unity web view: renders a page (e.g. WinCC Unified HMI) from headless Chrome/Edge/Chromium into a texture via the Chrome DevTools Protocol, with mouse, scroll and keyboard input.",
+  "unity": "2021.3",
+  "dependencies": {
+    "com.unity.nuget.newtonsoft-json": "3.2.1",
+    "com.unity.ugui": "1.0.0"
+  },
+  "author": { "name": "HMIViewport" }
+}
