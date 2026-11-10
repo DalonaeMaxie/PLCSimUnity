@@ -52,19 +52,6 @@ namespace PLCSimUnity.Shared
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 44)]
         public byte[] SelectedInstanceName;
 
-        public SharedMemoryHeader()
-        {
-            Status = 0;
-            State = 0;
-            Heartbeat = 0;
-            CurrentStage = 0;
-            InputBytesCount = 64;
-            OutputBytesCount = 64;
-            SelectedInstanceIndex = -1;
-            SelectedInstanceNameLength = 0;
-            SelectedInstanceName = new byte[44];
-        }
-
         public string GetSelectedInstanceNameString()
         {
             if (SelectedInstanceNameLength <= 0 || SelectedInstanceName == null)
@@ -76,6 +63,9 @@ namespace PLCSimUnity.Shared
 
         public void SetSelectedInstanceName(string instanceName)
         {
+            if (SelectedInstanceName == null)
+                SelectedInstanceName = new byte[44];
+
             if (string.IsNullOrEmpty(instanceName))
             {
                 SelectedInstanceNameLength = 0;

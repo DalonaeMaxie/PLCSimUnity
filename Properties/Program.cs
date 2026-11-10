@@ -49,6 +49,9 @@ namespace PLCSimUnity
             _view.Write(4, _inputBytesCount);
             _view.Write(8, _outputBytesCount);
 
+            // Launch interactive UI menu
+            InteractiveInstanceSelector.LaunchInteractiveMode();
+
             Thread watchdog = new Thread(WatchdogLoop) { IsBackground = true };
             watchdog.Start();
 
