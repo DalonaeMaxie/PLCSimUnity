@@ -1,319 +1,148 @@
 using System;
-using System.Collections.Generic;
 using System.IO.MemoryMappedFiles;
+using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using PLCSimUnity.Shared;
+using Siemens.Simatic.Simulation.Runtime;
 
 namespace PLCSimUnity
 {
-    /// <summary>
-    /// Interactive console UI for selecting and switching between PLC instances
-    /// Runs in separate thread from the main P/O communication loop
-    /// </summary>
-    public class InteractiveInstanceSelector
+    public static class InteractiveInstanceSelector
     {
-        private static MemoryMappedFile _mmf;
-        private static MemoryMappedViewAccessor _view;
-        private static List<InstanceSummary> _cachedInstances = new List<InstanceSummary>();
-        private static DateTime _lastRefresh = DateTime.MinValue;
-        private static readonly TimeSpan RefreshInterval = TimeSpan.FromSeconds(3);
+        private static byte _heartbeat = 0;
+        private static IInstance _activeInstance = null;
+        private static string _connectedInstanceName = "";
 
-        public static void LaunchInteractiveMode()
+        public static void StartWorker(MemoryMappedViewAccessor view, CancellationToken token)
         {
-            Thread uiThread = new Thread(InteractiveMenuLoop) { IsBackground = true };
-            uiThread.Start();
+            Task.Run(() => WorkerLoop(view, token), token);
         }
 
-        private static void InteractiveMenuLoop()
+        private static async Task WorkerLoop(MemoryMappedViewAccessor view, CancellationToken token)
         {
-            Console.WriteLine("\n[PLCSimUnity UI Mode] - Press 'M' to open menu anytime");
-
-            while (true)
+            while (!token.IsCancellationRequested)
             {
                 try
                 {
-                    if (Console.KeyAvailable)
+                    // 1. Increment Heartbeat Counter (Offset 2)
+                    unchecked { _heartbeat++; }
+                    view.Write(SharedMemoryConstants.Offset_Heartbeat, _heartbeat);
+
+                    // 2. Check if PLCSIM Advanced Runtime Manager is active
+                    if (!SimulationRuntimeManager.IsRuntimeManagerAvailable)
                     {
-                        var key = Console.ReadKey(true);
-                        if (key.Key == ConsoleKey.M || key.Key == ConsoleKey.H)
+                        ResetActiveInstance();
+                        view.Write(SharedMemoryConstants.Offset_Status, (byte)ServiceStatus.PlcSimNotRunning);
+                        view.Write(SharedMemoryConstants.Offset_State, (byte)EOperatingState.Off);
+                        await Task.Delay(100, token);
+                        continue;
+                    }
+
+                    // 3. Read Target Instance Name from Shared Memory
+                    int nameLen = view.ReadInt32(SharedMemoryConstants.Offset_SelectedInstanceNameLength);
+                    string targetInstanceName = "";
+                    if (nameLen > 0)
+                    {
+                        byte[] nameBuffer = new byte[nameLen];
+                        view.ReadArray(SharedMemoryConstants.Offset_SelectedInstanceName, nameBuffer, 0, nameLen);
+                        targetInstanceName = Encoding.UTF8.GetString(nameBuffer);
+                    }
+
+                    // Reconnect if user switched target instance in the dashboard
+                    if (_activeInstance != null &&
+                        !string.IsNullOrEmpty(targetInstanceName) &&
+                        !targetInstanceName.Equals("[Auto-Discover]", StringComparison.OrdinalIgnoreCase) &&
+                        !targetInstanceName.Equals(_connectedInstanceName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        ResetActiveInstance();
+                    }
+
+                    // 4. Connect to PLCSIM Advanced Instance if not currently connected
+                    if (_activeInstance == null)
+                    {
+                        _activeInstance = TryConnectPlcInstance(targetInstanceName, out _connectedInstanceName);
+                    }
+
+                    // 5. Transfer Telemetry & I/O Buffers via InputArea / OutputArea
+                    if (_activeInstance != null)
+                    {
+                        EOperatingState state = _activeInstance.OperatingState;
+                        view.Write(SharedMemoryConstants.Offset_State, (byte)state);
+
+                        if (state == EOperatingState.Run)
                         {
-                            ShowMainMenu();
+                            view.Write(SharedMemoryConstants.Offset_Status, (byte)ServiceStatus.Connected);
+
+                            // Sync Inputs from Unity (Offset 128) -> PLCSIM InputArea
+                            byte[] inBuffer = new byte[64];
+                            view.ReadArray(SharedMemoryConstants.Offset_InputData, inBuffer, 0, 64);
+                            _activeInstance.InputArea.WriteBytes(0U, inBuffer);
+
+                            // Sync Outputs from PLCSIM OutputArea -> Unity (Offset 192)
+                            byte[] outBuffer = _activeInstance.OutputArea.ReadBytes(0U, 64U);
+                            if (outBuffer != null && outBuffer.Length > 0)
+                            {
+                                view.WriteArray(SharedMemoryConstants.Offset_InputData + 64, outBuffer, 0, Math.Min(outBuffer.Length, 64));
+                            }
+                        }
+                        else
+                        {
+                            view.Write(SharedMemoryConstants.Offset_Status, (byte)ServiceStatus.InstanceNotRunning);
                         }
                     }
-                    Thread.Sleep(200);
+                    else
+                    {
+                        view.Write(SharedMemoryConstants.Offset_Status, (byte)ServiceStatus.InstanceNotFound);
+                        view.Write(SharedMemoryConstants.Offset_State, (byte)EOperatingState.Off);
+                    }
                 }
                 catch
                 {
-                    Thread.Sleep(1000);
+                    ResetActiveInstance();
+                    view.Write(SharedMemoryConstants.Offset_Status, (byte)ServiceStatus.PlcSimNotRunning);
+                    view.Write(SharedMemoryConstants.Offset_State, (byte)EOperatingState.Off);
                 }
+
+                await Task.Delay(20, token); // 50 Hz Coupler Loop
             }
         }
 
-        private static void ShowMainMenu()
+        private static IInstance TryConnectPlcInstance(string targetName, out string resolvedName)
         {
-            bool inMenu = true;
-            while (inMenu)
-            {
-                Console.Clear();
-                Console.WriteLine("╔════════════════════════════════════════╗");
-                Console.WriteLine("║   PLCSimUnity - Instance Selector     ║");
-                Console.WriteLine("╚════════════════════════════════════════╝");
-                Console.WriteLine();
-
-                // Show current instance
-                if (_view != null)
-                {
-                    try
-                    {
-                        string currentInstance = ReadSelectedInstanceName();
-                        Console.WriteLine($"Current Instance: {(string.IsNullOrEmpty(currentInstance) ? "[Auto-Discover]" : currentInstance)}");
-                    }
-                    catch { }
-                }
-
-                Console.WriteLine();
-                Console.WriteLine("1. List Available Instances");
-                Console.WriteLine("2. Connect to Instance");
-                Console.WriteLine("3. Enable Auto-Discover");
-                Console.WriteLine("4. Connection Status");
-                Console.WriteLine("5. Exit Menu");
-                Console.WriteLine();
-                Console.Write("Select option (1-5): ");
-
-                string input = Console.ReadLine();
-
-                switch (input)
-                {
-                    case "1":
-                        ShowAvailableInstances();
-                        break;
-                    case "2":
-                        SelectInstance();
-                        break;
-                    case "3":
-                        EnableAutoDiscover();
-                        break;
-                    case "4":
-                        ShowConnectionStatus();
-                        break;
-                    case "5":
-                        inMenu = false;
-                        break;
-                }
-            }
-
-            Console.WriteLine("\n[Menu closed - press 'M' to reopen]\n");
-        }
-
-        private static void ShowAvailableInstances()
-        {
-            Console.Clear();
-            Console.WriteLine("Scanning for available PLC instances...\n");
-
+            resolvedName = "";
             try
             {
                 var instances = PlcScanner.ScanForInstances(verbose: false);
+                if (instances == null || instances.Count == 0) return null;
 
-                if (instances.Count == 0)
+                InstanceSummary target = string.IsNullOrEmpty(targetName) || targetName.Equals("[Auto-Discover]", StringComparison.OrdinalIgnoreCase)
+                    ? instances.Find(i => i.OperatingState == EOperatingState.Run) ?? instances[0]
+                    : instances.Find(inst => inst.Name != null && inst.Name.Equals(targetName, StringComparison.OrdinalIgnoreCase));
+
+                if (target != null && !string.IsNullOrEmpty(target.Name))
                 {
-                    Console.WriteLine("No PLC instances found.");
-                }
-                else
-                {
-                    Console.WriteLine($"Found {instances.Count} instance(s):\n");
-                    for (int i = 0; i < instances.Count; i++)
-                    {
-                        var inst = instances[i];
-                        Console.WriteLine($"  [{i + 1}] {inst.Name}");
-                        Console.WriteLine($"      State: {inst.OperatingState}");
-                        Console.WriteLine($"      Type:  {inst.CpuType}");
-                        Console.WriteLine();
-                    }
+                    IInstance instance = SimulationRuntimeManager.CreateInterface(target.Name);
+                    resolvedName = target.Name;
+                    return instance;
                 }
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error scanning instances: {ex.Message}");
-            }
+            catch { }
 
-            Console.WriteLine("\nPress any key to continue...");
-            Console.ReadKey(true);
+            return null;
         }
 
-        private static void SelectInstance()
-        {
-            Console.Clear();
-            Console.WriteLine("Select Instance to Connect\n");
-
-            try
-            {
-                var instances = PlcScanner.ScanForInstances(verbose: false);
-
-                if (instances.Count == 0)
-                {
-                    Console.WriteLine("No PLC instances available.");
-                    Thread.Sleep(2000);
-                    return;
-                }
-
-                for (int i = 0; i < instances.Count; i++)
-                {
-                    Console.WriteLine($"[{i + 1}] {instances[i].Name} ({instances[i].OperatingState})");
-                }
-
-                Console.WriteLine();
-                Console.Write("Select instance number (1-{0}): ", instances.Count);
-
-                if (int.TryParse(Console.ReadLine(), out int choice) && choice > 0 && choice <= instances.Count)
-                {
-                    string selectedName = instances[choice - 1].Name;
-                    WriteSelectedInstanceName(selectedName);
-                    Console.WriteLine($"\n✓ Connecting to: {selectedName}");
-                    Thread.Sleep(2000);
-                }
-                else
-                {
-                    Console.WriteLine("\nInvalid selection.");
-                    Thread.Sleep(1500);
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error: {ex.Message}");
-                Thread.Sleep(2000);
-            }
-        }
-
-        private static void EnableAutoDiscover()
-        {
-            Console.Clear();
-            Console.WriteLine("Auto-Discover Mode");
-            Console.WriteLine();
-            Console.WriteLine("In Auto-Discover mode, the service will:");
-            Console.WriteLine("  • Automatically scan for running PLC instances");
-            Console.WriteLine("  • Connect to the first instance in RUN state");
-            Console.WriteLine("  • Auto-reconnect if the PLC stops and another starts");
-            Console.WriteLine();
-
-            try
-            {
-                WriteSelectedInstanceName(""); // Empty = auto-discover
-                Console.WriteLine("✓ Auto-Discover mode enabled");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error: {ex.Message}");
-            }
-
-            Console.WriteLine("\nPress any key to continue...");
-            Console.ReadKey(true);
-        }
-
-        private static void ShowConnectionStatus()
-        {
-            Console.Clear();
-            Console.WriteLine("Connection Status\n");
-
-            if (_view == null)
-            {
-                TryConnectToSharedMemory();
-            }
-
-            if (_view != null)
-            {
-                try
-                {
-                    byte status = _view.ReadByte(SharedMemoryConstants.Offset_Status);
-                    byte state = _view.ReadByte(SharedMemoryConstants.Offset_State);
-                    byte heartbeat = _view.ReadByte(SharedMemoryConstants.Offset_Heartbeat);
-                    int inputCount = _view.ReadInt32(SharedMemoryConstants.Offset_InputBytesCount);
-                    int outputCount = _view.ReadInt32(SharedMemoryConstants.Offset_OutputBytesCount);
-                    string instanceName = ReadSelectedInstanceName();
-
-                    Console.WriteLine($"Service Status:    {(ServiceStatus)status}");
-                    Console.WriteLine($"Current Instance:  {(string.IsNullOrEmpty(instanceName) ? "[Auto-Discover]" : instanceName)}");
-                    Console.WriteLine($"State Code:        {state}");
-                    Console.WriteLine($"Heartbeat:         {heartbeat}");
-                    Console.WriteLine($"Input Bytes:       {inputCount}");
-                    Console.WriteLine($"Output Bytes:      {outputCount}");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error reading status: {ex.Message}");
-                }
-            }
-            else
-            {
-                Console.WriteLine("Cannot connect to service shared memory.");
-                Console.WriteLine("Make sure the background service is running.");
-            }
-
-            Console.WriteLine("\nPress any key to continue...");
-            Console.ReadKey(true);
-        }
-
-        private static void TryConnectToSharedMemory()
+        private static void ResetActiveInstance()
         {
             try
             {
-                _mmf = MemoryMappedFile.OpenExisting(SharedMemoryConstants.DefaultShmName);
-                _view = _mmf.CreateViewAccessor();
+                _activeInstance?.Dispose();
             }
-            catch
+            catch { }
+            finally
             {
-                _view = null;
-            }
-        }
-
-        private static string ReadSelectedInstanceName()
-        {
-            if (_view == null)
-                TryConnectToSharedMemory();
-
-            if (_view == null)
-                return "";
-
-            try
-            {
-                int length = _view.ReadInt32(SharedMemoryConstants.Offset_SelectedInstanceNameLength);
-                if (length <= 0)
-                    return "";
-
-                byte[] nameBuffer = new byte[length];
-                _view.ReadArray(SharedMemoryConstants.Offset_SelectedInstanceName, nameBuffer, 0, length);
-                return System.Text.Encoding.UTF8.GetString(nameBuffer);
-            }
-            catch
-            {
-                return "";
-            }
-        }
-
-        private static void WriteSelectedInstanceName(string instanceName)
-        {
-            if (_view == null)
-                TryConnectToSharedMemory();
-
-            if (_view == null)
-                throw new InvalidOperationException("Cannot connect to shared memory.");
-
-            byte[] nameBytes = string.IsNullOrEmpty(instanceName)
-                ? new byte[0]
-                : System.Text.Encoding.UTF8.GetBytes(instanceName);
-
-            int lengthToWrite = Math.Min(nameBytes.Length, SharedMemoryConstants.MaxInstanceNameLength);
-
-            // Write length
-            _view.Write(SharedMemoryConstants.Offset_SelectedInstanceNameLength, lengthToWrite);
-
-            // Clear buffer
-            byte[] clearBuffer = new byte[SharedMemoryConstants.MaxInstanceNameLength];
-            _view.WriteArray(SharedMemoryConstants.Offset_SelectedInstanceName, clearBuffer, 0, clearBuffer.Length);
-
-            // Write new name
-            if (lengthToWrite > 0)
-            {
-                _view.WriteArray(SharedMemoryConstants.Offset_SelectedInstanceName, nameBytes, 0, lengthToWrite);
+                _activeInstance = null;
+                _connectedInstanceName = "";
             }
         }
     }
