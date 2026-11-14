@@ -265,9 +265,10 @@ namespace PLCSimUnity.PLCSimUnityUI
                 lblPlcInstance.Text = $"Active Instance: {instanceName}";
                 lblPlcHeartbeat.Text = $"Heartbeat: {heartbeat}";
 
-                // --- 2. UNITY 3D TELEMETRY ---
-                int currentUnityTick = _view.ReadInt32(100); // Read Unity Heartbeat Timestamp
-                bool isUnityConnected = (Environment.TickCount - currentUnityTick) < 2000 && currentUnityTick > 0;
+                // 2. Unity 3D Engine Telemetry
+                int currentUnityTick = _view.ReadInt32(100);
+                uint elapsedMs = unchecked((uint)(Environment.TickCount - currentUnityTick));
+                bool isUnityConnected = currentUnityTick != 0 && elapsedMs < 2000;
 
                 lblUnityStatus.Text = isUnityConnected ? "● Unity 3D Engine: Connected" : "● Unity 3D Engine: Disconnected";
                 lblUnityStatus.ForeColor = isUnityConnected ? Color.Green : Color.DarkOrange;

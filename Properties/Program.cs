@@ -1,5 +1,8 @@
 ﻿using System;
+using System.IO;
 using System.IO.MemoryMappedFiles;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Threading;
 using System.Windows.Forms;
 using PLCSimUnity.HMIViewport;
@@ -52,7 +55,21 @@ namespace PLCSimUnity
                 int frameBufferSize = 1920 * 1080 * 4;
                 int totalShmSize = SharedMemoryConstants.HeaderSize + inputBytesCount + outputBytesCount + frameBufferSize;
 
-                _mmf = MemoryMappedFile.CreateOrOpen(shmName, totalShmSize);
+                // Grant Read/Write access to non-elevated processes (e.g., Unity Editor)
+                MemoryMappedFileSecurity mmfSecurity = new MemoryMappedFileSecurity();
+                mmfSecurity.AddAccessRule(new AccessRule<MemoryMappedFileRights>(
+                    new SecurityIdentifier(WellKnownSidType.WorldSid, null),
+                    MemoryMappedFileRights.FullControl,
+                    AccessControlType.Allow));
+
+                _mmf = MemoryMappedFile.CreateOrOpen(
+                    shmName,
+                    totalShmSize,
+                    MemoryMappedFileAccess.ReadWrite,
+                    MemoryMappedFileOptions.None,
+                    mmfSecurity,
+                    HandleInheritability.None);
+
                 _view = _mmf.CreateViewAccessor();
 
                 if (!string.IsNullOrEmpty(instanceName) && !instanceName.Equals("AutoDiscover", StringComparison.OrdinalIgnoreCase))
@@ -63,13 +80,9 @@ namespace PLCSimUnity
                     _view.WriteArray(SharedMemoryConstants.Offset_SelectedInstanceName, nameBytes, 0, len);
                 }
 
-                // Call the worker directly from InteractiveInstanceSelector.cs
                 InteractiveInstanceSelector.StartWorker(_view, _cts.Token);
-
-                // Start WinCC Runtime Monitoring
                 WinCCRuntimeMonitor.StartMonitoring(_view, _cts.Token);
 
-                // Start WinForms UI Event Loop
                 Application.Run(new DashboardForm(_view));
             }
             catch (Exception ex)
