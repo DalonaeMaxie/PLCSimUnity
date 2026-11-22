@@ -21,6 +21,7 @@ namespace PLCSimUnity.HMIViewport
             Thread monitorThread = new Thread(() =>
             {
                 int frameCounter = 0;
+                int frameSequence = view.ReadInt32(SharedMemoryConstants.Offset_FrameSequence) & ~1;
 
                 while (!token.IsCancellationRequested)
                 {
@@ -38,16 +39,20 @@ namespace PLCSimUnity.HMIViewport
                             view.Write(SharedMemoryConstants.Offset_BrowserDebugPort, 0); // Native app
                             view.Write(SharedMemoryConstants.Offset_ScreenCaptureFrameRate, 30);
 
-                            // Capture live frame
-                            byte[] frameBuffer = WinCCScreenCapturer.CaptureWindowFrame(hWnd, out int width, out int height);
-                            if (frameBuffer != null && frameBuffer.Length > 0)
+                            // Capture a fixed-size frame so its dimensions and row stride match Unity's texture.
+                            byte[] frameBuffer = WinCCScreenCapturer.CaptureWindowFrame(hWnd, 1920, 1080, out int width, out int height);
+                            if (frameBuffer != null && frameBuffer.Length == width * height * 4)
                             {
+                                int pixelDataOffset = SharedMemoryConstants.HeaderSize + 128; // Offset 256
+                                int writingSequence = unchecked(frameSequence + 1);
+                                int completedSequence = unchecked(frameSequence + 2);
+                                view.Write(SharedMemoryConstants.Offset_FrameSequence, writingSequence);
+                                view.WriteArray(pixelDataOffset, frameBuffer, 0, frameBuffer.Length);
+                                view.Write(SharedMemoryConstants.Offset_FrameSequence, completedSequence);
+                                frameSequence = completedSequence;
+                                view.Write(SharedMemoryConstants.Offset_LastFrameTimestamp, Environment.TickCount);
                                 frameCounter++;
                                 view.Write(SharedMemoryConstants.Offset_TotalFramesCaptured, frameCounter);
-                                view.Write(SharedMemoryConstants.Offset_LastFrameTimestamp, Environment.TickCount);
-
-                                int pixelDataOffset = SharedMemoryConstants.HeaderSize + 128; // Offset 256
-                                view.WriteArray(pixelDataOffset, frameBuffer, 0, Math.Min(frameBuffer.Length, 1920 * 1080 * 4));
                             }
                         }
                         else

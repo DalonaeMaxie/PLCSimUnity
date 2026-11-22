@@ -1,463 +1,114 @@
-# Code Reference Guide
+# PLCSimUnity Code Reference
 
-## Quick Reference - Key Implementations
+## Entry Point
 
-### 1. Opening the Interactive Menu
-**File:** `Properties/InteractiveInstanceSelector.cs`
+`Properties/Program.cs` is responsible for startup:
 
-```csharp
-// Called from Program.cs on startup
-InteractiveInstanceSelector.LaunchInteractiveMode();
+- Parses command-line arguments.
+- Creates or opens the named memory-mapped file.
+- Writes an initial instance selection if `--instance` is present.
+- Starts the PLC and WinCC worker threads.
+- Opens `DashboardForm`.
+- Cancels background work and disposes memory-mapped resources on exit.
+
+## PLC Worker
+
+`Properties/InteractiveInstanceSelector.cs` runs as an asynchronous background loop.
+
+Every 20 ms, it:
+
+1. Increments the heartbeat at offset 2.
+2. Checks `SimulationRuntimeManager.IsRuntimeManagerAvailable`.
+3. Reads the target instance name at offsets 16/20.
+4. Creates or reconnects the Siemens `IInstance` interface.
+5. Writes status and state telemetry.
+6. Copies Unity input bytes to `InputArea`.
+7. Copies PLC output bytes from `OutputArea` into shared memory.
+
+The worker is a 50 Hz coupler. It does not block the WinForms UI thread.
+
+## Instance Discovery
+
+`Properties/InstanceScan.cs` uses `SimulationRuntimeManager.RegisteredInstanceInfo` and `CreateInterface(name)` to inspect instances.
+
+Each scan has a three-second timeout intended to prevent a non-responsive runtime interface from blocking the dashboard. The dashboard scan and worker each invoke discovery as appropriate.
+
+## Shared Memory Protocol
+
+`Properties/SharedMemoryProtocol.cs` defines:
+
+- `ServiceStatus`
+- `RuntimeScreenStatus`
+- `SharedMemoryHeader`
+- `SharedMemoryConstants`
+
+Use the constants in `SharedMemoryConstants` instead of hard-coding offsets in new code.
+
+The region layout is:
+
+```text
+0x000-0x07F  Header (128 bytes)
+0x080-0x0BF  Unity input area (64 bytes)
+0x0C0-0x0FF  PLCSIM output area (64 bytes)
+0x100-0x?    HMI frame and future data
 ```
 
-This launches a background thread that:
-- Monitors for 'M' key press
-- Shows interactive menu without blocking I/O
-- Reads/writes to shared memory for instance selection
-
-### 2. Instance Selection in Background Service
-**File:** `Properties/Program.cs`
-
-```csharp
-// Called in main I/O loop (Stage 2)
-CheckForUIInstanceSelection();
-
-private static void CheckForUIInstanceSelection()
-{
-	if (_view == null) return;
-
-	try
-	{
-		int nameLength = _view.ReadInt32(20);
-		if (nameLength > 0)
-		{
-			byte[] nameBuffer = new byte[nameLength];
-			_view.ReadArray(24, nameBuffer, 0, nameLength);
-			string selectedName = System.Text.Encoding.UTF8.GetString(nameBuffer);
-
-			if (!string.IsNullOrEmpty(selectedName) && selectedName != _instanceName)
-			{
-				_instanceName = selectedName;
-				_isAutoDiscover = false;
-				Console.WriteLine($"[PLCSimUnity] UI selected instance: {_instanceName}");
-			}
-		}
-	}
-	catch { }
-}
-```
-
-**How it works:**
-- Reads shared memory at offset 20 (name length)
-- Reads instance name at offset 24 (max 44 bytes)
-- Updates service's current instance if different
-- Disables auto-discover when instance is manually selected
-
-### 3. Shared Memory Communication
-**File:** `Properties/SharedMemoryProtocol.cs`
-
-```csharp
-// Memory layout offsets
-public static class SharedMemoryConstants
-{
-	public const int Offset_Status = 0;
-	public const int Offset_State = 1;
-	public const int Offset_Heartbeat = 2;
-	public const int Offset_CurrentStage = 3;
-	public const int Offset_InputBytesCount = 4;
-	public const int Offset_OutputBytesCount = 8;
-	public const int Offset_SelectedInstanceNameLength = 16;
-	public const int Offset_SelectedInstanceName = 20;
-	public const int Offset_InputData = 64;
-}
-
-// Status codes
-public enum ServiceStatus : byte
-{
-	Uninitialized = 0,
-	PlcSimNotRunning = 1,
-	InstanceNotFound = 2,
-	InstanceNotRunning = 3,
-	Connected = 4,
-	Error = 5
-}
-```
-
-### 4. Reading Instance Name from Menu
-**File:** `Properties/InteractiveInstanceSelector.cs`
-
-```csharp
-private static string ReadSelectedInstanceName()
-{
-	if (_view == null)
-		TryConnectToSharedMemory();
-
-	if (_view == null)
-		return "";
-
-	try
-	{
-		int length = _view.ReadInt32(SharedMemoryConstants.Offset_SelectedInstanceNameLength);
-		if (length <= 0)
-			return "";
-
-		byte[] nameBuffer = new byte[length];
-		_view.ReadArray(SharedMemoryConstants.Offset_SelectedInstanceName, 
-					   nameBuffer, 0, length);
-		return System.Text.Encoding.UTF8.GetString(nameBuffer);
-	}
-	catch
-	{
-		return "";
-	}
-}
-```
-
-### 5. Writing Instance Name from Menu
-**File:** `Properties/InteractiveInstanceSelector.cs`
-
-```csharp
-private static void WriteSelectedInstanceName(string instanceName)
-{
-	if (_view == null)
-		TryConnectToSharedMemory();
-
-	if (_view == null)
-		throw new InvalidOperationException("Cannot connect to shared memory.");
-
-	byte[] nameBytes = string.IsNullOrEmpty(instanceName)
-		? new byte[0]
-		: System.Text.Encoding.UTF8.GetBytes(instanceName);
-
-	int lengthToWrite = Math.Min(nameBytes.Length, 44);
-
-	// Write length
-	_view.Write(SharedMemoryConstants.Offset_SelectedInstanceNameLength, lengthToWrite);
-
-	// Clear buffer
-	byte[] clearBuffer = new byte[44];
-	_view.WriteArray(SharedMemoryConstants.Offset_SelectedInstanceName, 
-					 clearBuffer, 0, clearBuffer.Length);
-
-	// Write new name
-	if (lengthToWrite > 0)
-	{
-		_view.WriteArray(SharedMemoryConstants.Offset_SelectedInstanceName, 
-						 nameBytes, 0, lengthToWrite);
-	}
-}
-```
-
-### 6. Interactive Menu Loop
-**File:** `Properties/InteractiveInstanceSelector.cs`
-
-```csharp
-private static void InteractiveMenuLoop()
-{
-	Console.WriteLine("\n[PLCSimUnity UI Mode] - Press 'M' to open menu anytime");
-
-	while (true)
-	{
-		try
-		{
-			if (Console.KeyAvailable)
-			{
-				var key = Console.ReadKey(true);
-				if (key.Key == ConsoleKey.M || key.Key == ConsoleKey.H)
-				{
-					ShowMainMenu();
-				}
-			}
-			Thread.Sleep(200);  // Check every 200ms - non-blocking
-		}
-		catch
-		{
-			Thread.Sleep(1000);
-		}
-	}
-}
-```
-
-**Key Points:**
-- Console.KeyAvailable doesn't block
-- Runs in separate background thread
-- Checks every 200ms for key press
-- Main I/O loop unaffected
-
-### 7. Medical Menu Implementation
-**File:** `Properties/InteractiveInstanceSelector.cs`
-
-```csharp
-private static void SelectInstance()
-{
-	Console.Clear();
-	Console.WriteLine("Select Instance to Connect\n");
-
-	try
-	{
-		var instances = PlcScanner.ScanForInstances(verbose: false);
-
-		if (instances.Count == 0)
-		{
-			Console.WriteLine("No PLC instances available.");
-			Thread.Sleep(2000);
-			return;
-		}
-
-		for (int i = 0; i < instances.Count; i++)
-		{
-			Console.WriteLine($"[{i + 1}] {instances[i].Name} ({instances[i].OperatingState})");
-		}
-
-		Console.WriteLine();
-		Console.Write("Select instance number (1-{0}): ", instances.Count);
-
-		if (int.TryParse(Console.ReadLine(), out int choice) && 
-			choice > 0 && choice <= instances.Count)
-		{
-			string selectedName = instances[choice - 1].Name;
-			WriteSelectedInstanceName(selectedName);
-			Console.WriteLine($"\n✓ Connecting to: {selectedName}");
-			Thread.Sleep(2000);
-		}
-	}
-	catch (Exception ex)
-	{
-		Console.WriteLine($"Error: {ex.Message}");
-		Thread.Sleep(2000);
-	}
-}
-```
-
-### 8. Connection Status Display
-**File:** `Properties/InteractiveInstanceSelector.cs`
-
-```csharp
-private static void ShowConnectionStatus()
-{
-	Console.Clear();
-	Console.WriteLine("Connection Status\n");
-
-	if (_view == null)
-		TryConnectToSharedMemory();
-
-	if (_view != null)
-	{
-		try
-		{
-			byte status = _view.ReadByte(SharedMemoryConstants.Offset_Status);
-			byte state = _view.ReadByte(SharedMemoryConstants.Offset_State);
-			byte heartbeat = _view.ReadByte(SharedMemoryConstants.Offset_Heartbeat);
-			int inputCount = _view.ReadInt32(SharedMemoryConstants.Offset_InputBytesCount);
-			int outputCount = _view.ReadInt32(SharedMemoryConstants.Offset_OutputBytesCount);
-			string instanceName = ReadSelectedInstanceName();
-
-			Console.WriteLine($"Service Status:    {(ServiceStatus)status}");
-			Console.WriteLine($"Current Instance:  {(string.IsNullOrEmpty(instanceName) ? "[Auto-Discover]" : instanceName)}");
-			Console.WriteLine($"State Code:        {state}");
-			Console.WriteLine($"Heartbeat:         {heartbeat}");
-			Console.WriteLine($"Input Bytes:       {inputCount}");
-			Console.WriteLine($"Output Bytes:      {outputCount}");
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Error reading status: {ex.Message}");
-		}
-	}
-	else
-	{
-		Console.WriteLine("Cannot connect to service shared memory.");
-	}
-
-	Console.WriteLine("\nPress any key to continue...");
-	Console.ReadKey(true);
-}
-```
-
-### 9. Auto-Discover Mode
-**File:** `Properties/InteractiveInstanceSelector.cs`
-
-```csharp
-private static void EnableAutoDiscover()
-{
-	Console.Clear();
-	Console.WriteLine("Auto-Discover Mode\n");
-	Console.WriteLine("In Auto-Discover mode, the service will:");
-	Console.WriteLine("  • Automatically scan for running PLC instances");
-	Console.WriteLine("  • Connect to the first instance in RUN state");
-	Console.WriteLine("  • Auto-reconnect if the PLC stops and another starts");
-	Console.WriteLine();
-
-	try
-	{
-		WriteSelectedInstanceName("");  // Empty = auto-discover
-		Console.WriteLine("✓ Auto-Discover mode enabled");
-	}
-	catch (Exception ex)
-	{
-		Console.WriteLine($"Error: {ex.Message}");
-	}
-
-	Console.WriteLine("\nPress any key to continue...");
-	Console.ReadKey(true);
-}
-```
-
----
-
-## Integration Points
-
-### In Program.cs Main Loop
-```csharp
-// After opening shared memory (line ~50)
-InteractiveInstanceSelector.LaunchInteractiveMode();
-
-// In main I/O loop, Stage 2 (line ~80)
-CheckForUIInstanceSelection();
-```
-
-### Shared Memory Header Layout
-```
-Bytes 0-19:   Service Status, Heartbeat, Stage, Counters
-Bytes 20-63:  Selected Instance Name (variable length)
-Bytes 64+:    Input/Output Data Buffers
-```
-
----
-
-## Thread Architecture
-
-```
-┌──────────────────────────────────────┐
-│  Main Thread (50 Hz I/O Cycle)       │
-│  ├─ Stage 1: Runtime check          │
-│  ├─ Stage 2: CheckForUIInstanceSelection() ← Reads SHM
-│  ├─ Stage 3-6: PLC I/O Exchange     │
-│  └─ Stage 8: Sleep 20ms              │
-└──────────────────────────────────────┘
-		 │
-		 │ Shared Memory
-		 │
-┌──────────────────────────────────────┐
-│  Menu Thread (Background)             │
-│  ├─ Check for 'M' key (200ms loop)   │
-│  ├─ Show menu if 'M' pressed         │
-│  └─ WriteSelectedInstanceName() → SHM │
-└──────────────────────────────────────┘
-```
-
-**Benefit:** Zero blocking between threads
-
----
-
-## Shared Memory Write/Read Example
-
-### Writing from Menu
-```csharp
-// Menu thread - User selects "Controller_1"
-WriteSelectedInstanceName("Controller_1");
-```
-
-### Reading in Service
-```csharp
-// Main thread - Service reads selection
-CheckForUIInstanceSelection();
-// Internally reads same bytes, updates _instanceName
-```
-
-**Result:** Instance changes instantly without restart
-
----
-
-## Error Handling Patterns
-
-### Graceful SHM Connection Loss
-```csharp
-private static void TryConnectToSharedMemory()
-{
-	try
-	{
-		_mmf = MemoryMappedFile.OpenExisting(SharedMemoryConstants.DefaultShmName);
-		_view = _mmf.CreateViewAccessor();
-	}
-	catch
-	{
-		_view = null;  // Silently fail and retry next check
-	}
-}
-```
-
-### Safe Instance Name Reading
-```csharp
-try
-{
-	// Try to read
-}
-catch
-{
-	return "";  // Return empty string on any error
-}
-```
-
-### Protected Menu Key Checking
-```csharp
-try
-{
-	if (Console.KeyAvailable)
-	{
-		var key = Console.ReadKey(true);
-		// Process key
-	}
-}
-catch
-{
-	Thread.Sleep(1000);  // Back off on error
-}
-```
-
----
-
-## Building Custom Extensions
-
-### Add New Menu Option
-```csharp
-private static void ShowMainMenu()
-{
-	// ... existing code ...
-	Console.WriteLine("6. Your Custom Option");  // Add this
-
-	case "6":
-		YourCustomFunction();
-		break;
-}
-
-private static void YourCustomFunction()
-{
-	Console.Clear();
-	Console.WriteLine("Your Custom Function\n");
-
-	// Access shared memory here
-	if (_view != null)
-	{
-		// Read from or write to SHM
-	}
-
-	Console.WriteLine("\nPress any key to continue...");
-	Console.ReadKey(true);
-}
-```
-
-### Access PLC Instance List
-```csharp
-var instances = PlcScanner.ScanForInstances(verbose: false);
-foreach (var inst in instances)
-{
-	Console.WriteLine($"Instance: {inst.Name}");
-	Console.WriteLine($"  State: {inst.OperatingState}");
-	Console.WriteLine($"  Type: {inst.CpuType}");
-}
-```
-
----
-
-This code reference provides all the key implementations for understanding and extending the PLCSimUnity UI system.
+The HMI monitor currently allocates the frame buffer after offset 256.
+
+## Dashboard
+
+`PLCSimUnityUI/DashboardForm.cs` provides:
+
+- 10 Hz PLC/Unity/HMI telemetry updates
+- Three-second instance refresh
+- Search and filtering
+- Manual instance selection
+- Auto-discovery selection
+
+Instance selection writes a UTF-8 name to offsets 16/20. An empty name means auto-discovery.
+
+## WinCC Monitor
+
+`HMIViewpoint/WinCCRuntimeMonitor.cs` searches for supported WinCC processes every 33 ms.
+
+On detection it writes:
+
+- Runtime screen status
+- Process PID
+- Debug port (0 for native capture)
+- Capture frame rate
+- Frame timestamp
+- Total frame count
+
+`HMIViewpoint/WinCCScreenCapturer.cs` captures the runtime window and writes RGB/BGRA frame bytes to offset 256.
+
+## Unity CDP Package
+
+The package under `HMIViewpoint/com.HMIViewport.cdpwebview/` contains:
+
+- `Runtime/WebViewPanel.cs` - Unity MonoBehaviour
+- `Runtime/CdpClient.cs` - Chrome DevTools Protocol WebSocket client
+- `Runtime/BrowserProcess.cs` - browser discovery and headless launch
+- `package.json` - Unity package metadata
+
+This source is not compiled by the WinForms project unless copied into a Unity project package folder.
+
+## Threading Notes
+
+- Shared memory access must remain thread-safe from a viewpoint perspective; each accessor performs direct reads/writes.
+- Instance selection is communicated by polling, not events.
+- The WinCC capture loop is separate from the PLC loop.
+- WinForms timers and controls execute on the UI thread.
+- Cleanup is centralized in `Program.Main`'s `finally` block.
+
+## Extending the Protocol
+
+When changing the shared-memory protocol:
+
+1. Update `SharedMemoryHeader`.
+2. Update `SharedMemoryConstants` with matching offsets.
+3. Update `Program.cs` memory allocation if header or buffer sizes change.
+4. Update this reference and `README.md`.
+5. Update every Unity client using the protocol.
+
+Do not reuse or shift existing offsets in a running integration without coordinating an application and Unity redeploy.

@@ -186,6 +186,7 @@ namespace PLCSimUnity.Shared
         public const int Offset_TotalFramesCaptured = 82;
         public const int Offset_BrowserUrl = 86;
         public const int Offset_Reserved = 98;
+        public const int Offset_FrameSequence = 104;
 
         // Input/Output data buffers start after header
         public const int Offset_InputData = 128; // Was 64, now 128

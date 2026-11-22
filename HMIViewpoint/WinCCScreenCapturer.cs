@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 
@@ -24,27 +25,26 @@ namespace PLCSimUnity.HMIViewport
 
         private const uint PW_RENDERFULLCONTENT = 0x00000002;
 
-        public static byte[] CaptureWindowFrame(IntPtr hWnd, out int width, out int height)
+        public static byte[] CaptureWindowFrame(IntPtr hWnd, int targetWidth, int targetHeight, out int width, out int height)
         {
-            width = 0;
-            height = 0;
+            width = targetWidth;
+            height = targetHeight;
 
-            if (hWnd == IntPtr.Zero) return null;
+            if (hWnd == IntPtr.Zero || targetWidth <= 0 || targetHeight <= 0) return null;
 
             GetWindowRect(hWnd, out RECT rect);
-            width = rect.Right - rect.Left;
-            height = rect.Bottom - rect.Top;
+            int sourceWidth = rect.Right - rect.Left;
+            int sourceHeight = rect.Bottom - rect.Top;
 
-            if (width <= 0 || height <= 0) return null;
+            if (sourceWidth <= 0 || sourceHeight <= 0) return null;
 
-            using (Bitmap bmp = new Bitmap(width, height, PixelFormat.Format32bppArgb))
+            using (Bitmap source = new Bitmap(sourceWidth, sourceHeight, PixelFormat.Format32bppArgb))
             {
-                using (Graphics g = Graphics.FromImage(bmp))
+                using (Graphics g = Graphics.FromImage(source))
                 {
                     IntPtr hdc = g.GetHdc();
                     try
                     {
-                        // Print native window content to GDI graphics context
                         PrintWindow(hWnd, hdc, PW_RENDERFULLCONTENT);
                     }
                     finally
@@ -53,14 +53,36 @@ namespace PLCSimUnity.HMIViewport
                     }
                 }
 
-                // Convert Bitmap to raw BGRA byte array for fast GPU texturing
-                BitmapData bmpData = bmp.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.ReadOnly, bmp.PixelFormat);
-                int bytes = Math.Abs(bmpData.Stride) * bmp.Height;
-                byte[] rgbValues = new byte[bytes];
-                Marshal.Copy(bmpData.Scan0, rgbValues, 0, bytes);
-                bmp.UnlockBits(bmpData);
+                using (Bitmap frame = new Bitmap(targetWidth, targetHeight, PixelFormat.Format32bppArgb))
+                {
+                    using (Graphics g = Graphics.FromImage(frame))
+                    {
+                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                        g.DrawImage(source, new Rectangle(0, 0, targetWidth, targetHeight));
+                    }
 
-                return rgbValues;
+                    BitmapData data = frame.LockBits(
+                        new Rectangle(0, 0, targetWidth, targetHeight),
+                        ImageLockMode.ReadOnly,
+                        PixelFormat.Format32bppArgb);
+                    try
+                    {
+                        int rowBytes = targetWidth * 4;
+                        byte[] pixels = new byte[rowBytes * targetHeight];
+                        for (int y = 0; y < targetHeight; y++)
+                        {
+                            IntPtr row = IntPtr.Add(data.Scan0, y * data.Stride);
+                            Marshal.Copy(row, pixels, y * rowBytes, rowBytes);
+                        }
+
+                        return pixels;
+                    }
+                    finally
+                    {
+                        frame.UnlockBits(data);
+                    }
+                }
             }
         }
     }
